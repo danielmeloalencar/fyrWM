@@ -12,11 +12,23 @@ import {
   IX11Mod,
   IXClient,
   IXEvent,
+  IXKeyEvent,
   IXScreen,
   X11_EVENT_TYPE,
+  X11_KEY_MODIFIER,
+  XFocusRevertTo,
 } from "./types/X11Types";
 const x11: IX11Mod = require("x11");
 const wmLogFilePath = join(homedir(), ".fyr", "logs", "wm.log");
+// Keysyms we care about – node‑x11 exposes an ASCII lookup helper
+const KS = (k: string) => x11.keySyms[`XK_${k}`];
+
+// These are standard PC keycodes – they’re stable on almost every layout
+const KEY_SPACE = 65;
+const KEY_Q = 24;
+const KEY_V = 55;
+const KEY_H = 43;
+const SUPER = X11_KEY_MODIFIER.Mod4Mask;
 
 // x11
 let X: IXClient;
@@ -104,6 +116,7 @@ const initCompositing = (): void => {
 };
 
 const initDesktop = async (display: XDisplay): Promise<number> => {
+  logToFile(wmLogFilePath, "initing desktop", LogLevel.DEBUG);
   screen = display.screen[0];
   root = screen.root;
   X.MapWindow(root);
@@ -454,185 +467,123 @@ const openApp = (
   }
 };
 
-/*
-  One side for windows with children will always match perfectly to 
-  the children's sum w/h due to constraints so we need to find which 
-  child(ren) matches the best and track them
-*/
-const findBestChildrenMatch = (
-  parentWindow: FyrWindow
-): [Array<FyrWindow>, SplitDirection] => {
-  logToFile(
-    wmLogFilePath,
-    "FINDING CHILD MATCH FOR PARENT: " + JSON.stringify(parentWindow),
-    LogLevel.DEBUG
-  );
-  let vertChildrenWidth = 0;
-  let vertChildren: Array<FyrWindow> = [];
+const GAP = 5; // 5 px spacing between tiles
+const TOL = 2; // pixel drift tolerance
+const eq = (a: number, b: number) => Math.abs(a - b) <= TOL;
 
-  let horizChildrenHeight = 0;
-  let horizChildren: Array<FyrWindow> = [];
+const stripIsContiguous = (
+  wins: FyrWindow[],
+  axis: "x" | "y",
+  size: "width" | "height"
+): boolean => {
+  if (wins.length === 0) return false;
 
-  for (const win of Array.from(allOpenedFyrWindows)) {
-    // First check for direct children with similar dimensions, easiest route
-    if (
-      (win.windowId === parentWindow.horizontalChildId ||
-        parentWindow.windowId === win.horizontalParentId) &&
-      win.y === parentWindow.y &&
-      win.height === parentWindow.height
-    ) {
-      return [[win], SplitDirection.Horizontal];
-    } else if (
-      (win.windowId === parentWindow.verticalChildId ||
-        win.verticalParentId === parentWindow.windowId) &&
-      win.x === parentWindow.x &&
-      win.width === parentWindow.width
-    ) {
-      return [[win], SplitDirection.Vertical];
-    }
-
-    // If there's a failure in finding an exact child match, find all bordering children
-
-    // Children sharing a vertical border
-    if (
-      win.y === parentWindow.y + parentWindow.height + 5 ||
-      win.y === parentWindow.y + parentWindow.height
-    ) {
-      // If within the parents width:
-      if (
-        win.x >= parentWindow.x &&
-        win.x + win.width <= parentWindow.x + parentWindow.width + 5
-      ) {
-        // Add widths and track children in case this side matches, account for margin
-        vertChildrenWidth += win.width;
-        vertChildren = vertChildren.concat([win]);
-        if (vertChildren.length >= 2) {
-          vertChildrenWidth += 5;
-        }
-      }
-    }
-
-    //Sharing a horizontal border
-    if (
-      win.x === parentWindow.x + parentWindow.width + 5 ||
-      win.x === parentWindow.x + parentWindow.width
-    ) {
-      if (
-        win.y >= parentWindow.y &&
-        win.y + win.height <= parentWindow.height + parentWindow.y + 10
-      ) {
-        horizChildrenHeight += win.height;
-        horizChildren = horizChildren.concat([win]);
-        if (horizChildren.length >= 2) {
-          horizChildrenHeight += 5;
-        }
-      }
-    }
+  let cursor = wins[0][axis];
+  for (const w of wins) {
+    if (!eq(w[axis], cursor)) return false; // gap or overlap
+    cursor += w[size] + GAP;
   }
-
-  if (vertChildrenWidth === parentWindow.width) {
-    return [vertChildren, SplitDirection.Vertical];
-  } else if (horizChildrenHeight === parentWindow.height) {
-    return [horizChildren, SplitDirection.Horizontal];
-  } else {
-    return [[], null];
-  }
+  return true;
 };
 
-// Same as children, one parenting side should match perfectly.
-const findBestParentMatch = (
-  deletedWindow: FyrWindow
+const stripMatchesLength = (
+  wins: FyrWindow[],
+  total: number,
+  size: "width" | "height"
+) =>
+  eq(
+    wins.reduce((s, w) => s + w[size], 0) + GAP * Math.max(wins.length - 1, 0),
+    total
+  );
+
+const findBestChildrenMatch = (
+  parent: FyrWindow
 ): [Array<FyrWindow>, SplitDirection] => {
-  let vertParentWidth = 0;
-  let vertParents: Array<FyrWindow> = [];
-  let horizParentHeight = 0;
-  let horizParents: Array<FyrWindow> = [];
-  // First look by id and compare sizes, easiest route
-  for (const parentWindow of Array.from(allOpenedFyrWindows)) {
-    logToFile(wmLogFilePath, JSON.stringify(parentWindow), LogLevel.ERROR);
-    if (
-      (parentWindow.windowId === deletedWindow.horizontalParentId ||
-        deletedWindow.windowId === parentWindow.horizontalChildId) &&
-      deletedWindow.height === parentWindow.height
-    ) {
-      return [[parentWindow], SplitDirection.Horizontal];
-    }
+  const bottom: FyrWindow[] = [];
+  const right: FyrWindow[] = [];
 
-    if (
-      (parentWindow.windowId === deletedWindow.verticalParentId ||
-        deletedWindow.windowId === parentWindow.verticalChildId) &&
-      deletedWindow.width === parentWindow.width
-    ) {
-      return [[parentWindow], SplitDirection.Vertical];
-    }
+  for (const w of Array.from(allOpenedFyrWindows)) {
+    if (w.windowId === parent.windowId) continue;
+
+    const touchesBottom =
+      (eq(w.y, parent.y + parent.height) ||
+        eq(w.y, parent.y + parent.height + GAP)) &&
+      w.x >= parent.x &&
+      w.x + w.width <= parent.x + parent.width + GAP;
+
+    if (touchesBottom) bottom.push(w);
+
+    const touchesRight =
+      (eq(w.x, parent.x + parent.width) ||
+        eq(w.x, parent.x + parent.width + GAP)) &&
+      w.y >= parent.y &&
+      w.y + w.height <= parent.y + parent.height + GAP;
+
+    if (touchesRight) right.push(w);
   }
 
-  for (const parentWindow of Array.from(allOpenedFyrWindows)) {
-    // Find adjacent parent windows if not successful
-    if (parentWindow.windowId !== deletedWindow.windowId) {
-      // Look for direct matches first
-      if (
-        parentWindow.height === deletedWindow.height &&
-        parentWindow.x + parentWindow.width + 5 === deletedWindow.x
-      ) {
-        return [[parentWindow], SplitDirection.Horizontal];
-      }
-
-      if (
-        parentWindow.width === deletedWindow.width &&
-        parentWindow.y + parentWindow.height + 5 === deletedWindow.y
-      ) {
-        return [[parentWindow], SplitDirection.Vertical];
-      }
-
-      // If no direct match, do the maths
-      if (parentWindow.y + parentWindow.height + 5 === deletedWindow.y) {
-        // Parents sharing a vertical border
-        if (
-          parentWindow.x >= deletedWindow.x &&
-          parentWindow.x + parentWindow.width <=
-            deletedWindow.x + deletedWindow.width
-        ) {
-          vertParentWidth += parentWindow.width;
-          vertParents = vertParents.concat([parentWindow]);
-        }
-      }
-
-      if (parentWindow.x + parentWindow.width + 5 === deletedWindow.x) {
-        if (
-          parentWindow.y >= deletedWindow.y &&
-          parentWindow.y + parentWindow.height <=
-            deletedWindow.y + deletedWindow.height
-        ) {
-          horizParentHeight += parentWindow.height;
-          horizParents = horizParents.concat([parentWindow]);
-        }
-      }
-    }
-  }
-
-  logToFile(
-    wmLogFilePath,
-    "VERT PARENTS:" + vertParentWidth.toString(),
-    LogLevel.DEBUG
-  );
-  logToFile(
-    wmLogFilePath,
-    "Horiz PARENTS:" + horizParentHeight.toString(),
-    LogLevel.DEBUG
-  );
-
-  if (vertParentWidth + 5 * (vertParents.length - 1) === deletedWindow.width) {
-    return [vertParents, SplitDirection.Vertical];
-  } else if (
-    horizParentHeight + 5 * (horizParents.length - 1) ===
-    deletedWindow.height
+  // (a) vertical stack ⇒ heights add up
+  bottom.sort((a, b) => a.x - b.x);
+  if (
+    stripIsContiguous(bottom, "x", "width") &&
+    stripMatchesLength(bottom, parent.width, "width")
   ) {
-    return [horizParents, SplitDirection.Horizontal];
-  } else {
-    logToFile(wmLogFilePath, "COULDNT RESIZE PARENTS", LogLevel.INFO);
-    return [[], null];
+    return [bottom, SplitDirection.Vertical];
   }
+
+  // (b) horizontal row ⇒ widths add up
+  right.sort((a, b) => a.y - b.y);
+  if (
+    stripIsContiguous(right, "y", "height") &&
+    stripMatchesLength(right, parent.height, "height")
+  ) {
+    return [right, SplitDirection.Horizontal];
+  }
+
+  return [[], null];
+};
+
+const findBestParentMatch = (
+  hole: FyrWindow
+): [Array<FyrWindow>, SplitDirection] => {
+  const top: FyrWindow[] = [];
+  const left: FyrWindow[] = [];
+
+  for (const p of Array.from(allOpenedFyrWindows)) {
+    if (p.windowId === hole.windowId) continue;
+
+    const touchesTop =
+      (eq(p.y + p.height, hole.y) || eq(p.y + p.height + GAP, hole.y)) &&
+      p.x >= hole.x &&
+      p.x + p.width <= hole.x + hole.width + GAP;
+
+    if (touchesTop) top.push(p);
+
+    const touchesLeft =
+      (eq(p.x + p.width, hole.x) || eq(p.x + p.width + GAP, hole.x)) &&
+      p.y >= hole.y &&
+      p.y + p.height <= hole.y + hole.height + GAP;
+
+    if (touchesLeft) left.push(p);
+  }
+
+  top.sort((a, b) => a.x - b.x);
+  if (
+    stripIsContiguous(top, "x", "width") &&
+    stripMatchesLength(top, hole.width, "width")
+  ) {
+    return [top, SplitDirection.Vertical];
+  }
+
+  left.sort((a, b) => a.y - b.y);
+  if (
+    stripIsContiguous(left, "y", "height") &&
+    stripMatchesLength(left, hole.height, "height")
+  ) {
+    return [left, SplitDirection.Horizontal];
+  }
+
+  return [[], null];
 };
 
 const resizeRepositionReparentChildren = (
@@ -643,11 +594,9 @@ const resizeRepositionReparentChildren = (
   let immediateVertChild: FyrWindow;
   let immediateHorzChild: FyrWindow;
   children.forEach((childWindow) => {
-    // Get immediate child for reparenting
     if (
       deletedParent.verticalChildId === childWindow.windowId ||
       childWindow.verticalParentId === deletedParent.windowId ||
-      // Sharing a vertical border and starting at the same X coordinate
       ((deletedParent.y + deletedParent.height + 5 === childWindow.y ||
         deletedParent.y + deletedParent.height === childWindow.y) &&
         deletedParent.x === childWindow.x)
@@ -720,11 +669,6 @@ const resizeRepositionReparentChildren = (
       horizontalParentId: deletedParent.horizontalParentId,
     });
   }
-
-  //TODO: INVESTIGATE
-  // Update parent's with new child Id's
-  // const horizontalParent = findFyrWindow(deletedParent.horizontalParentId);
-  // const verticalParent = findFyrWindow(deletedParent.verticalParentId);
 };
 
 const resizeRepositionRechildParents = (
@@ -833,8 +777,6 @@ const resizeRepositionRechildParents = (
   });
 };
 
-// TODO: Deleting the wrong elements from allOpenedFyrWindows. Maybe in openApp?
-// Elements resize and move correctly, but it can't find them in the set
 const resizeOnDestroy = (deletedWindow: FyrWindow): void => {
   if (deletedWindow) {
     const [childrenToResize, childSplitType] =
@@ -882,7 +824,6 @@ const resizeOnDestroy = (deletedWindow: FyrWindow): void => {
   return;
 };
 
-// Get window to delete and resize all windows
 const handleDestroyNotify = (wid: number) => {
   const windowToDelete: FyrWindow = findFyrWindow(wid);
   logToFile(
@@ -911,6 +852,9 @@ const initX11Client = async () => {
 
     X = display.client;
     await initDesktop(display);
+    logToFile(wmLogFilePath, "inited desktop", LogLevel.DEBUG);
+    const grab = (mods: number, key: number) =>
+      X.GrabKey(root, false, mods, key, 1 /*Async*/, 1 /*Async*/);
 
     X.InternAtom(false, "WM_CLASS", (err, atom) => {
       if (err) {
@@ -934,7 +878,9 @@ const initX11Client = async () => {
           x11.eventMask.SubstructureNotify |
           x11.eventMask.SubstructureRedirect |
           x11.eventMask.ButtonPress |
-          x11.eventMask.ButtonRelease,
+          x11.eventMask.ButtonRelease |
+          x11.eventMask.KeyPress |
+          x11.eventMask.KeyRelease,
       },
       (err) => {
         logToFile(
@@ -945,40 +891,50 @@ const initX11Client = async () => {
       }
     );
 
-    // Capture keyboard, mouse, and window events
     client.on("event", async (ev: IXEvent) => {
-      const { type } = ev;
-      switch (type) {
-        case X11_EVENT_TYPE.KeyPress:
-          if (ev.wid === launcherWid) return;
-          const focusedWindow =
-            ev.wid && ev.wid !== launcherWid ? findFyrWindow(ev.wid) : null;
-          currentWindowId =
-            ev.wid && ev.wid !== launcherWid ? ev.wid : currentWindowId;
-          currentResizableWindow =
-            ev.wid !== launcherWid && focusedWindow
-              ? focusedWindow
-              : currentResizableWindow;
-          break;
-        case X11_EVENT_TYPE.KeyRelease:
-          break;
+      logToFile(wmLogFilePath, "event", LogLevel.DEBUG);
+      logToFile(wmLogFilePath, ev.type.toString(), LogLevel.DEBUG);
+      const wid = ev.wid;
+      switch (ev.type) {
         case X11_EVENT_TYPE.ButtonPress:
+          if (wid) {
+            if (wid === launcherWid) {
+              focusWindow(launcherWid);
+            } else {
+              currentWindowId = wid;
+              currentResizableWindow = findFyrWindow(wid);
+              focusWindow(wid);
+            }
+          }
           break;
-        case X11_EVENT_TYPE.ButtonRelease:
+        case X11_EVENT_TYPE.KeyPress: {
+          const { keycode } = ev as IXKeyEvent;
+          const mods = (ev as IXKeyEvent).buttons;
+          logToFile(wmLogFilePath, "key press", LogLevel.DEBUG);
+          if (mods & SUPER) {
+            logToFile(wmLogFilePath, "clicking shortcut keys", LogLevel.DEBUG);
+          }
+
+          if (ev.wid && ev.wid !== launcherWid) {
+            currentWindowId = ev.wid;
+            currentResizableWindow = findFyrWindow(ev.wid);
+          }
           break;
-        case X11_EVENT_TYPE.MotionNotify:
-          break;
+        }
         case X11_EVENT_TYPE.EnterNotify:
-          break;
-        case X11_EVENT_TYPE.LeaveNotify:
-          break;
-        case X11_EVENT_TYPE.Expose:
-          break;
-        case X11_EVENT_TYPE.CreateNotify:
+          if (wid && wid !== launcherWid) {
+            currentWindowId = wid;
+            currentResizableWindow = findFyrWindow(wid);
+            focusWindow(wid);
+          }
           break;
         case X11_EVENT_TYPE.MapRequest:
-          openApp(ev.wid, splitDirection, currentWindowId);
-          currentWindowId = ev.wid !== launcherWid ? ev.wid : currentWindowId;
+          await openApp(wid, splitDirection, currentWindowId);
+          if (wid !== launcherWid) {
+            currentWindowId = wid;
+            currentResizableWindow = findFyrWindow(wid);
+            focusWindow(wid); // NEW ► focus new window
+          }
           break;
         case X11_EVENT_TYPE.DestroyNotify:
           if (openedWindows.has(ev.wid)) handleDestroyNotify(ev.wid);
@@ -987,36 +943,21 @@ const initX11Client = async () => {
               currentWindowId = null;
               currentResizableWindow = null;
             } else {
-              // Last opened or focused window
               currentWindowId = Array.from(openedWindows).pop() || null;
               currentResizableWindow = findFyrWindow(currentWindowId);
             }
           }
-          break;
-        case X11_EVENT_TYPE.UnmapNotify:
-          break;
-        case X11_EVENT_TYPE.MapNotify:
-          break;
-        case X11_EVENT_TYPE.MapRequest:
-          break;
-        case X11_EVENT_TYPE.ReparentNotify:
-          break;
-        case X11_EVENT_TYPE.ConfigureNotify:
-          break;
-        case X11_EVENT_TYPE.ConfigureRequest:
-          break;
-        case X11_EVENT_TYPE.ClientMessage:
-          break;
-        case X11_EVENT_TYPE.PropertyNotify:
-          break;
-        default:
           break;
       }
     });
   });
 };
 
-//---------------------------------------------- Electron----------------------------------------------------
+const focusWindow = (wid: number) => {
+  if (!wid) return;
+  X.SetInputFocus(wid, XFocusRevertTo.PointerRoot);
+  X.RaiseWindow(wid);
+};
 
 const getElectronWindowId = (browserWindow: BrowserWindow): number => {
   const nativeHandle = browserWindow.getNativeWindowHandle();
@@ -1028,20 +969,14 @@ app.whenReady().then(async () => {
   await initX11Client();
   initCompositing();
   const launcherShortcut = globalShortcut.register("Super+Space", () => {
-    if (launcherWid && launcherWindow.isVisible()) {
-      launcherWindow.hide();
-    } else if (launcherInited) {
-      launcherWindow.show();
-      X.RaiseWindow(launcherWid);
-      launcherWindow.webContents.executeJavaScript(
-        `document.querySelector('input').focus();`
-      );
+    if (launcherWid) {
+      X.DestroyWindow(launcherWid);
+      launcherWid = null;
     } else {
+      logToFile(wmLogFilePath, "opening launcher", LogLevel.DEBUG);
       openLauncher();
     }
   });
-  if (!launcherShortcut) {
-  }
 
   const closeAppShortcut = globalShortcut.register("Super+Q", () => {
     if (currentResizableWindow) {
@@ -1147,35 +1082,22 @@ ipcMain.handle("getApps", async () => {
   return apps;
 });
 
-// ipcMain.handle("getApps", async () => {
-//   const appPaths = ["/usr/share/applications"];
+const setWmClass = (wid: number, cls: string) => {
+  const val = Buffer.from(`${cls}\0${cls}\0`, "binary");
+  X.InternAtom(false, "WM_CLASS", (_, a) =>
+    X.InternAtom(false, "STRING", (_, s) =>
+      X.ChangeProperty(0, wid, a, s, 8, val)
+    )
+  );
+};
 
-//   const apps = [];
+const getWinId = (bw: BrowserWindow) =>
+  bw.getNativeWindowHandle().readUInt32LE(0);
 
-//   for (const path of appPaths) {
-//     try {
-//       const files = fs.readdirSync(path);
-
-//       for (const file of files) {
-//         if (file.endsWith(".desktop")) {
-//           const filePath = `${path}/${file}`;
-//           const data = fs.readFileSync(filePath, "utf-8");
-//           const appConfig = ini.parse(data);
-
-//           const desktopEntry = appConfig["Desktop Entry"];
-//           if (desktopEntry && desktopEntry.Name && desktopEntry.Exec) {
-//             apps.push({
-//               name: desktopEntry.Name,
-//               exec: desktopEntry.Exec,
-//             });
-//           }
-//         }
-//       }
-//     } catch (err) {}
-//   }
-
-//   return apps;
-// });
+const showLauncher = () => {
+  if (!launcherWindow.isVisible()) launcherWindow.show(); // not showInactive
+  focusWindow(launcherWid);
+};
 
 const setWindowClass = (windowId, className) => {
   const value = Buffer.from(`${className}\0${className}\0`, "binary");
@@ -1214,8 +1136,8 @@ const openLauncher = () => {
   launcherWid = getElectronWindowId(launcherWindow);
   launcherInited = true;
   setWindowClass(launcherWid, "electronTransparent");
-  X.RaiseWindow(launcherWid);
   X.MapWindow(launcherWid);
+  focusWindow(launcherWid);
   launcherWindow.webContents.executeJavaScript(
     `document.querySelector('input').focus();`
   );
